@@ -604,6 +604,9 @@ export default function MessageSearchPage({ activateResultsInChat = false, overl
   const [hasMore, setHasMore] = useState<boolean>(() => readSearchSnapshotForServer(serverId)?.hasMore ?? false);
   const [searchError, setSearchError] = useState<SearchFailureKind | null>(null);
   const [loadMoreError, setLoadMoreError] = useState(false);
+  const searchGenerationRef = useRef(0);
+  const readySearchGenerationRef = useRef<number | null>(null);
+  const loadMoreRequestRef = useRef<{ generation: number; controller: AbortController } | null>(null);
   const [searchNonce, setSearchNonce] = useState(0);
   const [isComposing, setIsComposing] = useState(false);
   const [selectedResultIdentity, setSelectedResultIdentity] = useState<string | null>(null);
@@ -1126,6 +1129,19 @@ export default function MessageSearchPage({ activateResultsInChat = false, overl
   // Same async-loader FP family.
   // oxlint-disable-next-line react-doctor/no-cascading-set-state
   useEffect(() => {
+    const generation = ++searchGenerationRef.current;
+    readySearchGenerationRef.current = null;
+    setLoadingMore(false);
+    let cancelled = false;
+    const controller = new AbortController();
+    const cancelRequests = () => {
+      cancelled = true;
+      controller.abort();
+      if (loadMoreRequestRef.current?.generation === generation) {
+        loadMoreRequestRef.current.controller.abort();
+        loadMoreRequestRef.current = null;
+      }
+    };
     const params = buildMessageSearchParams(0);
     if (!params) {
       setResults([]);
@@ -1136,7 +1152,7 @@ export default function MessageSearchPage({ activateResultsInChat = false, overl
       setSearchError(null);
       setLoadMoreError(false);
       cachedSearchSnapshot = null;
-      return;
+      return cancelRequests;
     }
 
     // If a remount lands with the same params we already have cached, the
@@ -1145,13 +1161,12 @@ export default function MessageSearchPage({ activateResultsInChat = false, overl
     const paramsKey = serializeSearchParams(params);
     const snapshotServerId = serverId ?? null;
     if (readSearchSnapshotForServer(snapshotServerId)?.paramsKey === paramsKey) {
+      readySearchGenerationRef.current = generation;
       setSearchError(null);
       setLoadMoreError(false);
-      return;
+      return cancelRequests;
     }
 
-    let cancelled = false;
-    const controller = new AbortController();
     const timer = window.setTimeout(async () => {
       setLoading(true);
       setLoadingMore(false);
@@ -1162,6 +1177,7 @@ export default function MessageSearchPage({ activateResultsInChat = false, overl
         if (!cancelled) {
           const nextResults: MessageSearchResult[] = Array.isArray(data.results) ? data.results : [];
           const nextHasMore = Boolean(data.hasMore);
+          readySearchGenerationRef.current = generation;
           setResults(nextResults);
           setResultsSearchQuery(typeof params.q === "string" ? params.q : "");
           setHasMore(nextHasMore);
@@ -1189,31 +1205,42 @@ export default function MessageSearchPage({ activateResultsInChat = false, overl
     }, 200);
 
     return () => {
-      cancelled = true;
+      cancelRequests();
       window.clearTimeout(timer);
-      controller.abort();
     };
   }, [buildMessageSearchParams, searchNonce, serverId]);
 
   const loadMoreResults = useCallback(async () => {
-    if (loadingMore) return;
+    const generation = searchGenerationRef.current;
+    // Old results stay visible during the first-page debounce. They must not
+    // supply an offset for the new query before its first page commits.
+    if (loadMoreRequestRef.current || readySearchGenerationRef.current !== generation) return;
     const params = buildMessageSearchParams(results.length);
     if (!params) return;
+    const request = { generation, controller: new AbortController() };
+    loadMoreRequestRef.current = request;
+    const isCurrentRequest = () => searchGenerationRef.current === generation
+      && loadMoreRequestRef.current === request
+      && !request.controller.signal.aborted;
     setLoadingMore(true);
     setLoadMoreError(false);
     try {
-      const { data } = await api.get("/messages/search", { params });
+      const { data } = await api.get("/messages/search", { params, signal: request.controller.signal });
+      if (!isCurrentRequest()) return;
       const nextResults = Array.isArray(data.results) ? data.results as MessageSearchResult[] : [];
       setResults((prev) => [...prev, ...nextResults]);
       setHasMore(Boolean(data.hasMore));
     } catch {
       // Preserve both the current page and the continuation state so the failed
       // page is visibly retryable instead of looking like the end of results.
-      setLoadMoreError(true);
+      if (isCurrentRequest()) setLoadMoreError(true);
     } finally {
-      setLoadingMore(false);
+      if (isCurrentRequest()) {
+        loadMoreRequestRef.current = null;
+        setLoadingMore(false);
+      }
     }
-  }, [buildMessageSearchParams, loadingMore, results.length]);
+  }, [buildMessageSearchParams, results.length]);
 
   const handleBack = useMobileBack(searchShortcutSource ?? railSearchSource ?? (slug ? `/s/${slug}` : "/"));
   const handleSearchEscape = useCallback(() => {

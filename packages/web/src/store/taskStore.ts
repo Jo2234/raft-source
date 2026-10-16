@@ -75,6 +75,9 @@ export interface ServerTaskPageState {
   /** True once at least one page for this status committed under the current
    *  connection generation. Reset by invalidateServerTasks (socket drop). */
   loaded: boolean;
+  /** A terminal lane visited before a gap must be refreshed even if its UI
+   *  remains expanded. Never-visited done/closed lanes stay lazy. */
+  reloadOnReconnect?: boolean;
 }
 
 interface TaskState {
@@ -85,6 +88,9 @@ interface TaskState {
   loadingByChannelId: Record<string, boolean>;
   loadedByChannelId: Record<string, boolean>;
   serverTasks: Task[];
+  /** Previous-generation rows retain full fields for summary enrichment only.
+   *  They never establish membership in the current server task list. */
+  serverTaskDetailsById: Record<string, Task>;
   serverLoading: boolean;
   /** True once a full /tasks/server load has committed under the current
    *  connection generation and the socket has kept serverTasks live since.
@@ -159,14 +165,25 @@ const ACTIVE_TASK_STATUSES: TaskStatus[] = ["todo", "in_progress", "in_review"];
 /** Page size for the summary /tasks/server reads (server cap is 500). */
 const SERVER_TASKS_PAGE_LIMIT = 100;
 
-function createEmptyServerTaskPages(): Record<TaskStatus, ServerTaskPageState> {
-  return {
+function createEmptyServerTaskPages(previous?: Record<TaskStatus, ServerTaskPageState>): Record<TaskStatus, ServerTaskPageState> {
+  const pages = {
     todo: { nextCursor: null, loading: false, loaded: false },
     in_progress: { nextCursor: null, loading: false, loaded: false },
     in_review: { nextCursor: null, loading: false, loaded: false },
     done: { nextCursor: null, loading: false, loaded: false },
     closed: { nextCursor: null, loading: false, loaded: false },
   };
+  for (const status of ["done", "closed"] as const) {
+    const lane = previous?.[status];
+    if (lane && (lane.loaded || lane.loading || lane.reloadOnReconnect)) {
+      (pages[status] as ServerTaskPageState).reloadOnReconnect = true;
+    }
+  }
+  return pages;
+}
+
+function serverTaskSummaryStatuses(pages: Record<TaskStatus, ServerTaskPageState>): TaskStatus[] {
+  return [...ACTIVE_TASK_STATUSES, ...(["done", "closed"] as const).filter((status) => pages[status].reloadOnReconnect)];
 }
 
 function shouldIncludeInServerTasks(task: Task): boolean {
@@ -221,6 +238,7 @@ function taskProjectionChanged(previous: Task, next: Task): boolean {
 }
 
 function patchTaskState(state: TaskState, task: Task): Partial<TaskState> {
+  recordLiveTaskMutation(task.id);
   const taskExists = state.tasks.some((item) => item.id === task.id);
   const tasks = taskExists
     ? state.tasks.map((item) => (item.id === task.id ? mergeTaskFields(item, task) : item))
@@ -272,6 +290,7 @@ function hydrateTaskMetadataState(
 }
 
 function removeTaskState(state: TaskState, taskId: string): Partial<TaskState> {
+  recordLiveTaskMutation(taskId);
   const knownTask = state.tasks.find((task) => task.id === taskId)
     ?? state.serverTasks.find((task) => task.id === taskId)
     ?? Object.values(state.tasksByChannelId).flat().find((task) => task.id === taskId)
@@ -381,18 +400,29 @@ function mergeServerTasksSnapshot(snapshot: Task[], touched: Set<string>, liveNo
 // committing page skips touched ids (the live store value is newer) instead of
 // rolling them back to the pre-event snapshot — the same lossless rule
 // loadTouchedIds gives the legacy full load.
-let summaryLoadTouchedIds: Set<string> | null = null;
-let summaryLoadsInFlight = 0;
+interface SummaryPageLoads {
+  generation: number;
+  touched: Set<string>;
+  pending: number;
+}
+let summaryPageLoads: SummaryPageLoads | null = null;
 
-function beginSummaryPageLoad(): Set<string> {
-  summaryLoadsInFlight += 1;
-  if (!summaryLoadTouchedIds) summaryLoadTouchedIds = new Set();
-  return summaryLoadTouchedIds;
+function recordLiveTaskMutation(taskId: string): void {
+  loadTouchedIds?.add(taskId);
+  summaryPageLoads?.touched.add(taskId);
 }
 
-function endSummaryPageLoad(): void {
-  summaryLoadsInFlight -= 1;
-  if (summaryLoadsInFlight === 0) summaryLoadTouchedIds = null;
+function beginSummaryPageLoad(generation: number): SummaryPageLoads {
+  if (summaryPageLoads?.generation !== generation) {
+    summaryPageLoads = { generation, touched: new Set(), pending: 0 };
+  }
+  summaryPageLoads.pending += 1;
+  return summaryPageLoads;
+}
+
+function endSummaryPageLoad(loads: SummaryPageLoads): void {
+  loads.pending -= 1;
+  if (summaryPageLoads === loads && loads.pending === 0) summaryPageLoads = null;
 }
 
 // Merge a fetched summary page into serverTasks: upsert-only (a page never
@@ -424,6 +454,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   loadingByChannelId: {},
   loadedByChannelId: {},
   serverTasks: [],
+  serverTaskDetailsById: {},
   serverLoading: false,
   serverTasksLoaded: false,
   serverTasksGeneration: 0,
@@ -562,19 +593,20 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     // Tasks-panel first screen: one small summary page per ACTIVE status
     // (?detail=summary&status=<one>&limit=N — the API takes exactly one status
     // per call) instead of the legacy unbounded full-row load. done/closed
-    // stay lazy: their first page is fetched when the user expands that
-    // section, further pages via the section's "Load more" affordance.
+    // stay lazy until visited. After a gap, refresh terminal lanes visited
+    // before the disconnect too: their sections may still be expanded.
     //
     // Loaded-skip mirrors loadServerTasks: once the first pages commit, the
     // socket keeps serverTasks live; invalidateServerTasks resets the lanes.
     const pages = get().serverTaskPages;
-    const needed = ACTIVE_TASK_STATUSES.filter((status) => !pages[status].loaded && !pages[status].loading);
+    const needed = serverTaskSummaryStatuses(pages).filter((status) => !pages[status].loaded && !pages[status].loading);
     if (needed.length === 0) return;
+    const startGeneration = get().serverTasksGeneration;
     set({ serverLoading: true });
     try {
       await Promise.all(needed.map((status) => get().loadServerTaskStatusPage(status)));
     } finally {
-      set({ serverLoading: false });
+      if (get().serverTasksGeneration === startGeneration) set({ serverLoading: false });
     }
   },
 
@@ -582,7 +614,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     const lane = get().serverTaskPages[status];
     if (lane.loading || (lane.loaded && lane.nextCursor === null)) return;
     const startGeneration = get().serverTasksGeneration;
-    const touched = beginSummaryPageLoad();
+    const loads = beginSummaryPageLoad(startGeneration);
+    const touched = loads.touched;
     set((state) => ({
       serverTaskPages: {
         ...state.serverTaskPages,
@@ -604,14 +637,25 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         state,
         "hydrate:server-page",
         status,
-        (current) => ({
-          serverTasks: mergeServerTaskPage(current.serverTasks, page, touched),
-          serverTaskPages: {
-            ...current.serverTaskPages,
-            [status]: { nextCursor, loading: false, loaded: true },
-          },
-          ...hydrateTaskMetadataState(current, page),
-        }),
+        (current) => {
+          // Previous-generation details can enrich rows the server returned,
+          // but cannot put an absent/deleted task back on the board. Skip live
+          // mutations for metadata too, so a stale page cannot roll back a
+          // task's status on its message while the board keeps the live row.
+          const currentById = new Map(current.serverTasks.map((task) => [task.id, task]));
+          const acceptedPage = page.filter((task) => !touched.has(task.id)).map((task) => {
+            const details = currentById.get(task.id) ?? current.serverTaskDetailsById[task.id];
+            return details ? mergeTaskFields(details, task) : task;
+          });
+          return {
+            serverTasks: mergeServerTaskPage(current.serverTasks, acceptedPage, touched),
+            serverTaskPages: {
+              ...current.serverTaskPages,
+              [status]: { nextCursor, loading: false, loaded: true },
+            },
+            ...hydrateTaskMetadataState(current, acceptedPage),
+          };
+        },
       ));
     } catch (err) {
       console.error("Failed to load server task page:", err);
@@ -629,7 +673,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         },
       }));
     } finally {
-      endSummaryPageLoad();
+      endSummaryPageLoad(loads);
     }
   },
 
@@ -638,11 +682,24 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     // serverTasks is no longer provably complete. Always bump the generation
     // (so an in-flight load cannot commit as current) and mark un-loaded. Lazy:
     // the next TasksPanel mount re-fetches; no eager refetch of the big list.
-    // The summary lanes reset too — their pages are just as gap-suspect.
+    // Rebuild membership from this generation's pages and live events. Keeping
+    // old rows visible with upsert-only paging would retain offline deletions
+    // and status moves forever. Cache full fields separately: absence from a
+    // partial page says nothing about later pages or lazy terminal lanes.
+    summaryPageLoads = null;
     set((s) => ({
+      serverTaskDetailsById: {
+        // Repeated disconnects before hydration must not discard the only
+        // remaining full-field cache. Once pages load, retain only their rows.
+        ...(!s.serverTasksLoaded && !Object.values(s.serverTaskPages).some((page) => page.loaded)
+          ? s.serverTaskDetailsById : {}),
+        ...Object.fromEntries(s.serverTasks.map((task) => [task.id, task])),
+      },
+      serverTasks: [],
+      serverLoading: false,
       serverTasksLoaded: false,
       serverTasksGeneration: s.serverTasksGeneration + 1,
-      serverTaskPages: createEmptyServerTaskPages(),
+      serverTaskPages: createEmptyServerTaskPages(s.serverTaskPages),
     }));
   },
 
@@ -663,7 +720,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     // the legacy unbounded load. loadActiveTaskSummaries is generation-gated +
     // lane-deduped, so this is a no-op if the lanes are already loading/loaded.
     if (s.serverTasksActiveConsumers > 0 && s.serverTasksGeneration > 0
-      && ACTIVE_TASK_STATUSES.some((status) => !s.serverTaskPages[status].loaded)) {
+      && serverTaskSummaryStatuses(s.serverTaskPages).some((status) => !s.serverTaskPages[status].loaded)) {
       void get().loadActiveTaskSummaries();
     }
   },
@@ -852,8 +909,6 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   upsertTask: (task) => {
     // Record the live mutation so an in-flight loadServerTasks merges rather
     // than overwrites it (lossless snapshot commit).
-    loadTouchedIds?.add(task.id);
-    summaryLoadTouchedIds?.add(task.id);
     const existing = findKnownTask(get(), task.id);
     const changed = !existing || taskProjectionChanged(existing, task);
     set((state) => reduceTaskWithTrace(
@@ -867,8 +922,6 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   },
 
   removeTask: (taskId) => {
-    loadTouchedIds?.add(taskId);
-    summaryLoadTouchedIds?.add(taskId);
     set((state) => reduceTaskWithTrace(
       state,
       "remove",
@@ -886,6 +939,7 @@ registerServerReset(() => {
   // before the mounted consumer re-registers against the new generation.
   inFlightTaskHistory.clear();
   pendingTaskHistoryRefresh.clear();
+  summaryPageLoads = null;
   useTaskStore.setState((s) => ({
     tasks: [],
     loading: false,
@@ -894,6 +948,7 @@ registerServerReset(() => {
     loadingByChannelId: {},
     loadedByChannelId: {},
     serverTasks: [],
+    serverTaskDetailsById: {},
     serverLoading: false,
     serverTasksLoaded: false,
     serverTasksGeneration: s.serverTasksGeneration + 1,

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { useLayoutEffect } from "react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
-import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
 import api from "../src/api/client";
 import type { User } from "../src/store/authStore";
 import type { Channel } from "../src/store/channelStore";
@@ -695,6 +695,57 @@ test("pagination failure keeps results and offers an inline retry", async () => 
   assert.equal((document.body.textContent ?? "").match(/pagination release note/g)?.length, 1, "retry must not duplicate the loaded page");
   assert.equal((document.body.textContent ?? "").match(/pagination-next release note/g)?.length, 1);
 });
+
+for (const staleOutcome of ["success", "failure"] as const) {
+  test(`a previous search's pagination ${staleOutcome} cannot change the current search`, async () => {
+    type SearchPage = { data: { hasMore: boolean; results: ReturnType<typeof makeMessageSearchResult>[] } };
+    let resolveOldPage!: (page: SearchPage) => void;
+    let rejectOldPage!: (error: Error) => void;
+    let oldSignal: AbortSignal | undefined;
+    const oldPage = new Promise<SearchPage>((resolve, reject) => {
+      resolveOldPage = resolve;
+      rejectOldPage = reject;
+    });
+    const oldQuery = `old-${staleOutcome}`;
+    const currentQuery = `current-${staleOutcome}`;
+    api.get = (async (_url: string, config?: { params?: Record<string, unknown>; signal?: AbortSignal }) => {
+      const query = String(config?.params?.q ?? "");
+      if (Number(config?.params?.offset ?? 0) === 0) {
+        return { data: { hasMore: true, results: [makeMessageSearchResult(query)] } };
+      }
+      if (query === oldQuery) {
+        oldSignal = config?.signal;
+        return oldPage; // Deliberately ignore abort to exercise the response ownership guard too.
+      }
+      return { data: { hasMore: true, results: [makeMessageSearchResult(`${currentQuery}-next`)] } };
+    }) as typeof api.get;
+
+    await renderSearchHome(new MemoryStorage());
+    const input = screen.getByPlaceholderText(/Search channels/) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: oldQuery } });
+    fireEvent.click(await screen.findByRole("button", { name: "Load More" }));
+    assert.ok(document.body.textContent?.includes(`${oldQuery} release note`));
+
+    fireEvent.change(input, { target: { value: currentQuery } });
+    await waitFor(() => assert.ok(document.body.textContent?.includes(`${currentQuery} release note`)));
+
+    await act(async () => {
+      if (staleOutcome === "success") {
+        resolveOldPage({ data: { hasMore: false, results: [makeMessageSearchResult(`${oldQuery}-next`)] } });
+      } else {
+        rejectOldPage(new Error("old page failed"));
+      }
+      await oldPage.catch(() => undefined);
+    });
+    assert.equal(document.body.textContent?.includes(`${oldQuery}-next release note`), false, "old rows contaminated the new query");
+    assert.equal(Boolean(screen.queryByRole("alert")), false, "an old failure surfaced under the new query");
+    assert.equal(oldSignal?.aborted, true, "changing the query must cancel its old pagination transport");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load More" }));
+    await waitFor(() => assert.ok(document.body.textContent?.includes(`${currentQuery}-next release note`)));
+    assert.ok(screen.getByRole("button", { name: "Load More" }), "the current page owns continuation state");
+  });
+}
 
 test("pinned channels do not populate Frequently Used without a Search open", async () => {
   api.get = (async () => ({ data: { hasMore: false, results: [] } })) as typeof api.get;
