@@ -47,6 +47,7 @@ import { registerTaskRealtimeHandlers } from "../src/store/taskRealtimeSync";
  */
 
 const originalGet = api.get.bind(api);
+const originalPatch = api.patch;
 
 function emptyPages() {
   return {
@@ -60,10 +61,11 @@ function emptyPages() {
 
 afterEach(() => {
   api.get = originalGet;
+  api.patch = originalPatch;
   useTaskStore.setState({
     tasks: [], loading: false, currentChannelId: null,
     tasksByChannelId: {}, loadingByChannelId: {}, loadedByChannelId: {},
-    serverTasks: [], serverLoading: false, serverTasksLoaded: false, serverTasksGeneration: 0,
+    serverTasks: [], serverTaskDetailsById: {}, serverLoading: false, serverTasksLoaded: false, serverTasksGeneration: 0,
     serverTasksActiveConsumers: 0,
     serverTaskPages: emptyPages(),
     taskMetadataByMessageId: {}, taskMessageIdByTaskId: {},
@@ -276,6 +278,150 @@ test("an open Tasks view catches up on reconnect via summary pages, never the un
     "reconnect catch-up fell back to the unparameterized full load",
   );
   cleanup();
+});
+
+test("reconnect rebuilds task membership after offline deletion and completion", async () => {
+  useTaskStore.getState().upsertTask(summaryTask({ id: "deleted-offline" }));
+  useTaskStore.getState().upsertTask(summaryTask({ id: "completed-offline" }));
+  useTaskStore.getState().upsertTask(summaryTask({ id: "old-done", status: "done" }));
+  useTaskStore.getState().registerServerTasksConsumer();
+  const urls = mockApi((url) => ({
+    tasks: url.includes("status=done") ? [summaryTask({ id: "completed-offline", status: "done" })] : [],
+    next_cursor: null,
+  }));
+  const { handlers, cleanup } = wireSocket();
+  try {
+    handlers.disconnect(undefined);
+    handlers.connect(undefined);
+    await flush();
+    assert.deepEqual(useTaskStore.getState().serverTasks, [], "pre-gap rows must not remain in active or lazy lanes");
+    assert.equal(urls.length, 3, "terminal statuses remain lazy");
+    await useTaskStore.getState().loadServerTaskStatusPage("done");
+    assert.deepEqual(useTaskStore.getState().serverTasks.map((task) => [task.id, task.status]), [["completed-offline", "done"]]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("reconnect pages rebuild visibility without losing details or earlier pages", async () => {
+  const first = summaryTask({ id: "first", description: "previously fetched full body" });
+  const second = summaryTask({ id: "second", taskNumber: 2 });
+  const deleted = summaryTask({ id: "deleted", taskNumber: 3 });
+  mockApi(() => ({ tasks: [first, second, deleted] }));
+  await useTaskStore.getState().loadServerTasks(); // full details need not be in a channel bucket
+  useTaskStore.getState().invalidateServerTasks();
+  mockApi((url) => ({
+    tasks: url.includes("cursor=") ? [second] : [summaryTask({ id: "first" })],
+    next_cursor: url.includes("cursor=") ? null : "page-2",
+  }));
+  await useTaskStore.getState().loadServerTaskStatusPage("todo");
+  assert.deepEqual(useTaskStore.getState().serverTasks.map((task) => task.id), ["first"], "unfetched old membership is not a new-generation page");
+  assert.equal(useTaskStore.getState().serverTasks[0].description, first.description, "summary hydration preserves unprojected full fields");
+  await useTaskStore.getState().loadServerTaskStatusPage("todo");
+  assert.deepEqual(useTaskStore.getState().serverTasks.map((task) => task.id), ["first", "second"], "page two appends without dropping page one or restoring an offline deletion");
+});
+
+test("reconnect refreshes previously visited terminal lanes and keeps unopened lanes lazy", async () => {
+  mockApi(() => ({ tasks: [summaryTask({ id: "deleted-done", status: "done" })], next_cursor: null }));
+  await useTaskStore.getState().loadServerTaskStatusPage("done");
+  useTaskStore.getState().registerServerTasksConsumer();
+  const urls = mockApi((url) => ({
+    tasks: url.includes("status=done") ? [summaryTask({ id: "current-done", status: "done" })] : [],
+    next_cursor: null,
+  }));
+  useTaskStore.getState().invalidateServerTasks();
+  useTaskStore.getState().invalidateServerTasks(); // another drop before catch-up must retain terminal intent
+  useTaskStore.getState().catchUpServerTasksOnReconnect();
+  await flush();
+  assert.equal(urls.length, 4, "three active lanes plus the previously visited done lane refresh");
+  assert.ok(!urls.some((url) => url.includes("status=closed")), "unopened closed lane stays lazy");
+  assert.deepEqual(useTaskStore.getState().serverTasks.map((task) => task.id), ["current-done"]);
+  assert.equal(useTaskStore.getState().serverTaskPages.done.loaded, true);
+  assert.equal(useTaskStore.getState().serverTaskPages.closed.loaded, false);
+});
+
+test("a lazy remount refreshes terminal lanes visited before the disconnect", async () => {
+  mockApi(() => ({ tasks: [summaryTask({ id: "deleted-done", status: "done" })], next_cursor: null }));
+  await useTaskStore.getState().loadServerTaskStatusPage("done");
+  const urls = mockApi(() => ({ tasks: [], next_cursor: null }));
+  useTaskStore.getState().invalidateServerTasks();
+  useTaskStore.getState().catchUpServerTasksOnReconnect(); // no consumer, so no eager fetch
+  assert.equal(urls.length, 0);
+  await useTaskStore.getState().loadActiveTaskSummaries();
+  assert.equal(urls.length, 4);
+  assert.deepEqual(useTaskStore.getState().serverTasks, []);
+});
+
+test("reconnect hydration preserves live create, update and delete events", async () => {
+  useTaskStore.getState().upsertTask(summaryTask({ id: "deleted-offline" }));
+  useTaskStore.getState().invalidateServerTasks();
+  let resolveFetch!: (value: unknown) => void;
+  api.get = (() => new Promise((resolve) => { resolveFetch = resolve; })) as typeof api.get;
+  const pending = useTaskStore.getState().loadServerTaskStatusPage("todo");
+  useTaskStore.getState().upsertTask(summaryTask({ id: "new-live" }));
+  useTaskStore.getState().upsertTask(summaryTask({ id: "moved-live", messageId: "moved-message", status: "done", revision: 2, title: "Live title" }));
+  useTaskStore.getState().removeTask("deleted-live");
+  resolveFetch({ data: { tasks: [
+    summaryTask({ id: "moved-live", messageId: "moved-message", title: "Old title" }),
+    summaryTask({ id: "deleted-live" }),
+    summaryTask({ id: "page-one" }),
+  ], next_cursor: "page-2" } });
+  await pending;
+  const tasks = useTaskStore.getState().serverTasks;
+  assert.deepEqual(tasks.map((task) => task.id).sort(), ["moved-live", "new-live", "page-one"]);
+  assert.equal(tasks.find((task) => task.id === "moved-live")?.status, "done");
+  assert.equal(useTaskStore.getState().taskMetadataByMessageId["moved-message"]?.status, "done", "a skipped stale page row must not roll back metadata");
+
+  // Continuation snapshots can race live changes too; do not replace earlier pages.
+  const pageTwo = useTaskStore.getState().loadServerTaskStatusPage("todo");
+  useTaskStore.getState().removeTask("page-one");
+  resolveFetch({ data: { tasks: [summaryTask({ id: "page-one" }), summaryTask({ id: "page-two" })], next_cursor: null } });
+  await pageTwo;
+  assert.deepEqual(useTaskStore.getState().serverTasks.map((task) => task.id).sort(), ["moved-live", "new-live", "page-two"]);
+});
+
+test("an older generation settling cannot clear a newer summary hydration's live mutation guard", async () => {
+  let resolveOld!: (value: unknown) => void;
+  let resolveNew!: (value: unknown) => void;
+  api.get = (() => new Promise((resolve) => { resolveOld = resolve; })) as typeof api.get;
+  const oldLoad = useTaskStore.getState().loadServerTaskStatusPage("todo");
+  useTaskStore.getState().invalidateServerTasks();
+  api.get = (() => new Promise((resolve) => { resolveNew = resolve; })) as typeof api.get;
+  const newLoad = useTaskStore.getState().loadServerTaskStatusPage("todo");
+  resolveOld({ data: { tasks: [summaryTask({ id: "old-generation" })], next_cursor: null } });
+  await oldLoad;
+  useTaskStore.getState().upsertTask(summaryTask({ id: "task-1", status: "done", title: "Live after old request settled" }));
+  resolveNew({ data: { tasks: [summaryTask()], next_cursor: null } });
+  await newLoad;
+  assert.deepEqual(useTaskStore.getState().serverTasks.map((task) => [task.id, task.status]), [["task-1", "done"]]);
+});
+
+test("a local status mutation during summary hydration wins over its older page", async () => {
+  useTaskStore.getState().upsertTask(summaryTask());
+  let resolveFetch!: (value: unknown) => void;
+  api.get = (() => new Promise((resolve) => { resolveFetch = resolve; })) as typeof api.get;
+  api.patch = (async () => ({ data: { task: summaryTask({ status: "done", revision: 2 }) } })) as typeof api.patch;
+  const page = useTaskStore.getState().loadServerTaskStatusPage("todo");
+  await useTaskStore.getState().updateTaskStatus("channel-1", "task-1", "done");
+  resolveFetch({ data: { tasks: [summaryTask()], next_cursor: null } });
+  await page;
+  assert.equal(useTaskStore.getState().serverTasks[0].status, "done");
+  assert.equal(useTaskStore.getState().taskMetadataByMessageId["msg-1"].status, "done");
+});
+
+test("a superseded active-lane batch cannot clear the reconnect loading state", async () => {
+  const resolveFetches: Array<(value: unknown) => void> = [];
+  api.get = (() => new Promise((resolve) => { resolveFetches.push(resolve); })) as typeof api.get;
+  const oldBatch = useTaskStore.getState().loadActiveTaskSummaries();
+  useTaskStore.getState().invalidateServerTasks();
+  const reconnectBatch = useTaskStore.getState().loadActiveTaskSummaries();
+  assert.equal(resolveFetches.length, 6);
+  for (const resolve of resolveFetches.slice(0, 3)) resolve({ data: { tasks: [], next_cursor: null } });
+  await oldBatch;
+  assert.equal(useTaskStore.getState().serverLoading, true, "the newer batch still owns the loading state");
+  for (const resolve of resolveFetches.slice(3)) resolve({ data: { tasks: [], next_cursor: null } });
+  await reconnectBatch;
+  assert.equal(useTaskStore.getState().serverLoading, false);
 });
 
 test("a 400 (stale cursor) resets the lane so the next walk restarts from the beginning", async () => {
